@@ -1,0 +1,147 @@
+import express from 'express'
+import path from 'path'
+import fs from 'fs'
+import crypto from 'crypto'
+import { runCommand } from './deploy.js'
+import { ensureDockerfile } from './dockerline.js'
+
+const app = express()
+app.use(express.json())
+
+
+const deployments = {} // store deployment statuses in memory for simplicity
+const TERMINAL = new Set(['complete', 'failed'])
+
+// only allow http(s)/git URLs so a value like "--upload-pack=..." can't be parsed as a git option
+const isValidRepoUrl = (url) =>
+    typeof url === 'string' && /^(https?:\/\/|git:\/\/|ssh:\/\/|git@)/.test(url)
+
+function sseSend(res, payload) {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok' })
+})
+
+app.post('/deploy', async (req, res) => {
+    const { repoUrl } = req.body
+
+    if (!repoUrl) {
+        return res.status(400).json({ error: 'repoUrl is required' })
+    }
+    if (!isValidRepoUrl(repoUrl)) {
+        return res.status(400).json({ error: 'repoUrl must be an http(s), git, or ssh URL' })
+    }
+
+    // generate a simple unique ID for this deployment
+    const deploymentId = `deploy-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
+    const buildDir = path.join('/tmp', 'builds', deploymentId)
+
+    // make sure the builds directory exists
+    fs.mkdirSync(buildDir, { recursive: true })
+
+    console.log(`[${deploymentId}] Starting deployment of ${repoUrl}`)
+
+    // respond immediately — the build happens in the background
+    res.json({ deploymentId, status: 'cloning' })
+    deployments[deploymentId] = { status: 'cloning', logs: [], clients: [] }
+
+
+    function pushLog(line) {
+        deployments[deploymentId].logs.push(line)
+        deployments[deploymentId].clients.forEach((client) => {
+            sseSend(client, { type: 'log', deploymentId, line })
+        })
+    }
+
+    function pushStatus(status) {
+        const d = deployments[deploymentId]
+        d.status = status
+        d.clients.forEach((client) => {
+            sseSend(client, { type: 'status', deploymentId, status })
+            // close streams once the deployment is finished
+            if (TERMINAL.has(status)) client.end()
+        })
+        if (TERMINAL.has(status)) d.clients = []
+    }
+
+    try {
+        await runCommand('git', ['clone', '--', repoUrl, buildDir], {
+            onLog: (line) => {
+                console.log(`[${deploymentId}] ${line.trim()}`)
+                pushLog(line.trim())
+            }
+        })
+        console.log(`[${deploymentId}] Clone successful`)
+        pushStatus('cloned')
+        let dockerfileResult;
+        try {
+            dockerfileResult = ensureDockerfile(buildDir, { dockerfileContent: req.body.dockerfileContent })
+            pushLog(`Dockerfile Ready: {source: ${dockerfileResult.source}}${dockerfileResult.runtime ? `, runtime: ${dockerfileResult.runtime}` : ''}`)
+        } catch (error) {
+            pushLog(error.message)
+            pushStatus('failed')
+            return
+        }
+
+        pushStatus('building')
+        await runCommand('docker', ['build', '-t', `myapp:${deploymentId}`, buildDir], {
+            cwd: buildDir,
+            onLog: (line) => {
+                pushLog(line.trim())
+            }
+        })
+
+        pushStatus('complete')
+
+    } catch (err) {
+        console.error(`[${deploymentId}] Deployment failed:`, err.message)
+        pushLog(`Error: ${err.message}`)
+        pushStatus('failed')
+    }
+})
+
+app.get('/deploy/:id', (req, res) => {
+    const deployment = deployments[req.params.id]
+    if (!deployment) {
+        return res.status(404).json({ error: 'Deployment not found' })
+    }
+
+    res.json({ deploymentId: req.params.id, status: deployment.status })
+})
+
+
+app.get('/deploy/:id/logs', (req, res) => {
+    const deployment = deployments[req.params.id]
+    if (!deployment) {
+        return res.status(404).json({ error: 'Deployment not found' })
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('Connection', 'keep-alive')
+    res.flushHeaders()
+
+    // send existing logs
+    deployment.logs.forEach((line) => {
+        sseSend(res, { type: 'log', deploymentId: req.params.id, line })
+    })
+
+    // already finished: send the final status and close
+    if (TERMINAL.has(deployment.status)) {
+        sseSend(res, { type: 'status', deploymentId: req.params.id, status: deployment.status })
+        return res.end()
+    }
+
+    deployment.clients.push(res)
+
+    req.on('close', () => {
+        deployment.clients = deployment.clients.filter((client) => client !== res)
+    })
+})
+
+
+app.listen(3000, () => {
+    console.log('Platform server running on port 3000')
+})
