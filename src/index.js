@@ -4,13 +4,26 @@ import fs from 'fs'
 import crypto from 'crypto'
 import { runCommand } from './deploy.js'
 import { ensureDockerfile } from './dockerline.js'
+import { createHostRouter, createUpgradeHandler } from './routing.js'
+import {
+    createDeployment, updateStatus,
+    appendLog, getDeployment, getLogs,
+    setDockerfileInfo, failStaleDeployments,
+    setContainerInfo
+} from './db.js'
 
 const app = express()
+
+// must come first: routes <id>.<PLATFORM_HOST> to deployments before any body parsing or API routes
+const PLATFORM_HOST = process.env.PLATFORM_HOST || 'localhost'
+app.use(createHostRouter({ platformHost: PLATFORM_HOST, getDeployment }))
+
 app.use(express.json())
 
+failStaleDeployments() // mark any stale deployments as failed on startup
 
 const deployments = {} // store deployment statuses in memory for simplicity
-const TERMINAL = new Set(['complete', 'failed'])
+const TERMINAL = new Set(['running', 'complete', 'failed'])
 
 // only allow http(s)/git URLs so a value like "--upload-pack=..." can't be parsed as a git option
 const isValidRepoUrl = (url) =>
@@ -44,11 +57,13 @@ app.post('/deploy', async (req, res) => {
     console.log(`[${deploymentId}] Starting deployment of ${repoUrl}`)
 
     // respond immediately — the build happens in the background
+    createDeployment(deploymentId, repoUrl)
     res.json({ deploymentId, status: 'cloning' })
     deployments[deploymentId] = { status: 'cloning', logs: [], clients: [] }
 
 
     function pushLog(line) {
+        appendLog(deploymentId, line)
         deployments[deploymentId].logs.push(line)
         deployments[deploymentId].clients.forEach((client) => {
             sseSend(client, { type: 'log', deploymentId, line })
@@ -56,6 +71,7 @@ app.post('/deploy', async (req, res) => {
     }
 
     function pushStatus(status) {
+        updateStatus(deploymentId, status)
         const d = deployments[deploymentId]
         d.status = status
         d.clients.forEach((client) => {
@@ -79,6 +95,7 @@ app.post('/deploy', async (req, res) => {
         try {
             dockerfileResult = ensureDockerfile(buildDir, { dockerfileContent: req.body.dockerfileContent })
             pushLog(`Dockerfile Ready: {source: ${dockerfileResult.source}}${dockerfileResult.runtime ? `, runtime: ${dockerfileResult.runtime}` : ''}`)
+            setDockerfileInfo(deploymentId, dockerfileResult.source, dockerfileResult.runtime)
         } catch (error) {
             pushLog(error.message)
             pushStatus('failed')
@@ -86,24 +103,45 @@ app.post('/deploy', async (req, res) => {
         }
 
         pushStatus('building')
-        await runCommand('docker', ['build', '-t', `myapp:${deploymentId}`, buildDir], {
-            cwd: buildDir,
+        await runCommand('docker', ['build', '-t', `myapp:${deploymentId}`, dockerfileResult.appDir], {
+            cwd: dockerfileResult.appDir,
             onLog: (line) => {
                 pushLog(line.trim())
             }
         })
 
-        pushStatus('complete')
+        // pushStatus('complete')
+        console.log(`[${deploymentId}] Deployment complete`)
+        console.log(`[${deploymentId}] Docker image: myapp:${deploymentId}`)
+        console.log(`Opening a container shell.....`)
+        const name = `app-${deploymentId}`
+        await runCommand('docker', [
+            'run', '-d', '--name', name, '-e', 'PORT=3000', '-p', '127.0.0.1::3000', `myapp:${deploymentId}`
+        ])
+
+        const [mapping] = await runCommand('docker', ['port', name, '3000/tcp'], { captureOutput: true, onLog: pushLog })
+        const dockerPort = Number(mapping.trim().split(':')[1])
+        const isInteger = Number.isInteger(dockerPort)
+        if (!isInteger || dockerPort < 1 || dockerPort > 65535) {
+            setContainerInfo(deploymentId, null, name)
+            throw new Error(`Invalid host port mapping for container ${name}. Received: ${mapping.trim()}`)
+        } else {
+            setContainerInfo(deploymentId, dockerPort, name)
+        }
+        pushStatus('running')
+        console.log(`[${deploymentId}] Container started: http://${mapping.trim()}`)
+        console.log(`[${deploymentId}] Container running: ${name}`)
+        console.log(`[${deploymentId}] Port mapping: ${mapping.trim()}`)
 
     } catch (err) {
         console.error(`[${deploymentId}] Deployment failed:`, err.message)
         pushLog(`Error: ${err.message}`)
-        pushStatus('failed')
+        getDeployment(deploymentId).status === 'complete' ? pushStatus('complete') : getDeployment(deploymentId).status === 'running' ? pushStatus('failed') : pushStatus('failed')
     }
 })
 
 app.get('/deploy/:id', (req, res) => {
-    const deployment = deployments[req.params.id]
+    const deployment = getDeployment(req.params.id)
     if (!deployment) {
         return res.status(404).json({ error: 'Deployment not found' })
     }
@@ -113,7 +151,8 @@ app.get('/deploy/:id', (req, res) => {
 
 
 app.get('/deploy/:id/logs', (req, res) => {
-    const deployment = deployments[req.params.id]
+    const live = deployments[req.params.id]
+    const deployment = getDeployment(req.params.id)
     if (!deployment) {
         return res.status(404).json({ error: 'Deployment not found' })
     }
@@ -124,24 +163,28 @@ app.get('/deploy/:id/logs', (req, res) => {
     res.flushHeaders()
 
     // send existing logs
-    deployment.logs.forEach((line) => {
+    const logs = getLogs(req.params.id)
+    logs.forEach((line) => {
         sseSend(res, { type: 'log', deploymentId: req.params.id, line })
     })
 
     // already finished: send the final status and close
-    if (TERMINAL.has(deployment.status)) {
+    if (TERMINAL.has(deployment.status) || !live) {
         sseSend(res, { type: 'status', deploymentId: req.params.id, status: deployment.status })
         return res.end()
     }
 
-    deployment.clients.push(res)
+    live.clients.push(res)
 
     req.on('close', () => {
-        deployment.clients = deployment.clients.filter((client) => client !== res)
+        live.clients = live.clients.filter((client) => client !== res)
     })
 })
 
 
-app.listen(3000, () => {
+const server = app.listen(3000, () => {
     console.log('Platform server running on port 3000')
 })
+
+// WebSocket / Upgrade requests never reach Express; Node emits them separately
+server.on('upgrade', createUpgradeHandler({ platformHost: PLATFORM_HOST, getDeployment }))

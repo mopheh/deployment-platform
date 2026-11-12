@@ -13,6 +13,8 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'queued',
     dockerfile_source TEXT,
     runtime TEXT,
+    host_port INTEGER,
+    container_name TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
@@ -24,6 +26,7 @@ db.exec(`
     created_at INTEGER NOT NULL,
     FOREIGN KEY (deployment_id) REFERENCES deployments(id)
   );
+
 `)
 
 
@@ -69,7 +72,19 @@ const statements = {
             SELECT line FROM deployment_logs 
             WHERE deployment_id = ?
             ORDER BY id ASC
-            `)
+            `),
+
+  updateContainerInfo: db.prepare(`
+    UPDATE deployments
+    SET host_port = @hostPort, container_name = @containerName, updated_at = @updatedAt
+    WHERE id = @id
+  `),
+
+  failStaleDeployments: db.prepare(`
+    UPDATE deployments
+    SET status = 'failed'
+    WHERE status NOT IN ('complete', 'failed') 
+  `)
 }
 
 // update createDeployment function
@@ -101,5 +116,11 @@ function getDeployment(id) {
 function getLogs(deploymentId) {
   return statements.getLogs.all(deploymentId).map(r => r.line)
 }
+function failStaleDeployments() {
+  statements.failStaleDeployments.run()
+}
+function setContainerInfo(id, hostPort, containerName) {
+  statements.updateContainerInfo.run({ id, hostPort, containerName, updatedAt: Date.now() })
+}
 
-export { createDeployment, updateStatus, appendLog, getDeployment, getLogs, setDockerfileInfo }
+export { createDeployment, updateStatus, appendLog, getDeployment, getLogs, setDockerfileInfo, failStaleDeployments, setContainerInfo }
