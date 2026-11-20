@@ -1,37 +1,4 @@
-import Database from 'better-sqlite3'
-import path from 'path'
-import { fileURLToPath } from 'url'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-
-const db = new Database(path.join(__dirname, '..', 'platform.db'))
-// update the CREATE TABLE statement
-db.exec(`
-  CREATE TABLE IF NOT EXISTS deployments (
-    id TEXT PRIMARY KEY,
-    repo_url TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued',
-    dockerfile_source TEXT,
-    runtime TEXT,
-    host_port INTEGER,
-    container_name TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS deployment_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    deployment_id TEXT NOT NULL,
-    line TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    FOREIGN KEY (deployment_id) REFERENCES deployments(id)
-  );
-
-`)
-
-
-
-
+import { db } from './connection.js'
 
 // add a new function to update dockerfile info after detection
 const updateDockerfileInfo = db.prepare(`
@@ -49,8 +16,8 @@ function setDockerfileInfo(id, source, runtime = null) {
 // SQLite compiles the query plan once; much faster than raw strings each time
 const statements = {
   insertDeployment: db.prepare(`
-    INSERT INTO deployments (id, repo_url, status, dockerfile_source, runtime, created_at, updated_at)
-    VALUES (@id, @repoUrl, @status, @dockerfileSource, @runtime, @createdAt, @updatedAt)
+    INSERT INTO deployments (id, repo_url, status, dockerfile_source, dockerfile_content, runtime, env_json, build_env_json, created_at, updated_at)
+    VALUES (@id, @repoUrl, @status, @dockerfileSource, @dockerfileContent, @runtime, @envJson, @buildEnvJson, @createdAt, @updatedAt)
     `),
 
   updateStatus: db.prepare(`
@@ -80,22 +47,41 @@ const statements = {
     WHERE id = @id
   `),
 
-  failStaleDeployments: db.prepare(`
+  // crashed mid-build: put the job back in the queue so a worker retries it
+  requeueInterrupted: db.prepare(`
     UPDATE deployments
-    SET status = 'failed'
-    WHERE status NOT IN ('complete', 'failed') 
-  `)
+    SET status = 'queued', updated_at = @now
+    WHERE status IN ('cloning', 'cloned', 'building')
+  `),
+
+  // TODO: instead check whether the container is still alive
+  failRunning: db.prepare(`
+    UPDATE deployments
+    SET status = 'failed', updated_at = @now
+    WHERE status = 'running'
+  `),
+
+  claimNextJob: db.prepare(`
+    UPDATE deployments
+    SET status = 'cloning', updated_at = @now
+    WHERE id = (SELECT id from deployments WHERE status = 'queued' 
+    ORDER BY created_at ASC LIMIT 1)
+    RETURNING *
+    `)
 }
 
-// update createDeployment function
-function createDeployment(id, repoUrl) {
+// env and buildEnv must already be validated { KEY: "value" } objects (see lib/env.js)
+function createDeployment(id, repoUrl, { dockerfileContent = null, env = {}, buildEnv = {} } = {}) {
   const now = Date.now()
   statements.insertDeployment.run({
     id,
     repoUrl,
-    status: 'cloning',
+    status: 'queued',
+    dockerfileContent,
     dockerfileSource: null,
     runtime: null,
+    envJson: JSON.stringify(env ?? {}),
+    buildEnvJson: JSON.stringify(buildEnv ?? {}),
     createdAt: now,
     updatedAt: now
   })
@@ -116,11 +102,19 @@ function getDeployment(id) {
 function getLogs(deploymentId) {
   return statements.getLogs.all(deploymentId).map(r => r.line)
 }
-function failStaleDeployments() {
-  statements.failStaleDeployments.run()
+function recoverDeployments() {
+  const now = Date.now()
+  statements.requeueInterrupted.run({ now })
+  statements.failRunning.run({ now })
 }
 function setContainerInfo(id, hostPort, containerName) {
   statements.updateContainerInfo.run({ id, hostPort, containerName, updatedAt: Date.now() })
 }
 
-export { createDeployment, updateStatus, appendLog, getDeployment, getLogs, setDockerfileInfo, failStaleDeployments, setContainerInfo }
+function claimNextJob() {
+  return statements.claimNextJob.get({ now: Date.now() })
+}
+
+
+
+export { createDeployment, updateStatus, appendLog, getDeployment, getLogs, setDockerfileInfo, recoverDeployments, setContainerInfo, claimNextJob }

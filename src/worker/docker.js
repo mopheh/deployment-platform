@@ -39,11 +39,15 @@ const detectRuntime = (root) => {
 }
 
 const templates = {
-    nodejs: `FROM node:18-alpine
+    nodejs: `FROM node:24-alpine
 WORKDIR /app
 COPY package*.json ./
-RUN npm install --production
+RUN npm install
 COPY . .
+# BUILD_ARGS
+RUN npm run build --if-present
+RUN npm prune --omit=dev
+ENV NODE_ENV=production
 CMD ["npm", "start"]
 EXPOSE 3000
 `,
@@ -97,14 +101,23 @@ EXPOSE 3000
 }
 
 
+// Where generated templates declare the user's build-time variables. `docker build --build-arg X=..`
+// is ignored unless the Dockerfile has `ARG X`. Only ARG (never ENV): ENV would persist in the final image.
+const BUILD_ARGS_MARKER = '# BUILD_ARGS'
+
+// options.buildArgNames: names of the variables passed with --build-arg.
+// Returns buildArgsApplied = true only if we put the ARG lines into the Dockerfile ourselves;
+// for a repo's own Dockerfile or custom dockerfileContent the user must declare them.
 const ensureDockerfile = (dir, options = {}) => {
+    const buildArgNames = options.buildArgNames ?? []
+
     if (hasDockerfile(dir)) {
-        return { source: "repo", appDir: dir }
+        return { source: "repo", appDir: dir, buildArgsApplied: false }
     }
 
     if (options.dockerfileContent) {
         fs.writeFileSync(path.join(dir, 'Dockerfile'), options.dockerfileContent)
-        return { source: "custom", appDir: dir }
+        return { source: "custom", appDir: dir, buildArgsApplied: false }
     }
 
     const found = detectRuntime(dir)
@@ -116,7 +129,18 @@ const ensureDockerfile = (dir, options = {}) => {
         )
     }
 
-    fs.writeFileSync(path.join(found.appDir, 'Dockerfile'), templates[found.runtime])
-    return { source: "generated", runtime: found.runtime, appDir: found.appDir }
+    const template = templates[found.runtime]
+    const hasMarker = template.includes(BUILD_ARGS_MARKER)
+    // names were validated by lib/env.js, and a function replacement avoids `$&`-style replacement patterns
+    const argLines = buildArgNames.map((name) => `ARG ${name}\n`).join('')
+    const dockerfile = template.replace(`${BUILD_ARGS_MARKER}\n`, () => argLines)
+
+    fs.writeFileSync(path.join(found.appDir, 'Dockerfile'), dockerfile)
+    return {
+        source: "generated",
+        runtime: found.runtime,
+        appDir: found.appDir,
+        buildArgsApplied: hasMarker && buildArgNames.length > 0,
+    }
 }
 export { ensureDockerfile, hasDockerfile, detectRuntime }
